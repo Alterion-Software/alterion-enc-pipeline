@@ -3,7 +3,7 @@
 //!
 //! The primary entry point is [`interceptor::Interceptor`]: mount it as an Actix-web middleware
 //! and every encrypted request is transparently decrypted, and every response re-encrypted,
-//! using the RSA + AES-256-GCM + HMAC-SHA256 pipeline.
+//! using the X25519 ECDH + AES-256-GCM + HMAC-SHA256 pipeline.
 //!
 //! ## Example
 //!
@@ -24,7 +24,7 @@
 //!
 //! #[actix_web::main]
 //! async fn main() -> std::io::Result<()> {
-//!     // Rotate RSA keys every hour; keep the previous key live for 5 minutes.
+//!     // Rotate ECDH keys every hour; keep the previous key live for 5 minutes.
 //!     let store = init_key_store(3600);
 //!     start_rotation(store.clone(), 3600);
 //!
@@ -42,7 +42,7 @@
 pub mod interceptor;
 pub mod tools;
 
-pub use alterion_key_exchange::{
+pub use alterion_ecdh::{
     KeyStore, KeyEntry, EcdhError,
     init_key_store, start_rotation, get_current_public_key, ecdh,
 };

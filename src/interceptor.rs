@@ -8,7 +8,7 @@ use futures_util::future::{ready, LocalBoxFuture, Ready};
 use futures_util::TryStreamExt;
 use std::{rc::Rc, sync::Arc};
 use tokio::sync::RwLock;
-use alterion_key_exchange::{KeyStore, ecdh};
+use alterion_ecdh::{KeyStore, ecdh};
 use crate::tools::crypt::aes_decrypt;
 use crate::tools::serializer::{deserialize_packet, build_signed_response_raw, derive_session_keys, verify_packet_mac};
 
