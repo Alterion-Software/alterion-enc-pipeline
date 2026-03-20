@@ -8,7 +8,7 @@
 //! ## Example
 //!
 //! ```rust,no_run
-//! use alterion_encrypt::{init_key_store, start_rotation};
+//! use alterion_encrypt::{init_key_store, init_handshake_store, start_rotation};
 //! use alterion_encrypt::interceptor::{Interceptor, DecryptedBody};
 //! use actix_web::{web, App, HttpServer, HttpRequest, HttpMessage, HttpResponse, post, get};
 //!
@@ -26,11 +26,12 @@
 //! async fn main() -> std::io::Result<()> {
 //!     // Rotate ECDH keys every hour; keep the previous key live for 5 minutes.
 //!     let store = init_key_store(3600);
-//!     start_rotation(store.clone(), 3600);
+//!     let hs    = init_handshake_store();
+//!     start_rotation(store.clone(), 3600, hs.clone());
 //!
 //!     HttpServer::new(move || {
 //!         App::new()
-//!             .wrap(Interceptor { key_store: store.clone() })
+//!             .wrap(Interceptor { key_store: store.clone(), handshake_store: hs.clone(), replay_store: None })
 //!             .service(example_handler)
 //!     })
 //!     .bind("0.0.0.0:8080")?
@@ -43,6 +44,8 @@ pub mod interceptor;
 pub mod tools;
 
 pub use alterion_ecdh::{
-    KeyStore, KeyEntry, EcdhError,
-    init_key_store, start_rotation, get_current_public_key, ecdh,
+    KeyStore, KeyEntry, EcdhError, HandshakeStore,
+    init_key_store, init_handshake_store,
+    start_rotation, get_current_public_key,
+    ecdh, init_handshake, ecdh_ephemeral, prune_handshakes,
 };

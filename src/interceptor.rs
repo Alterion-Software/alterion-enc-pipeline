@@ -8,9 +8,11 @@ use futures_util::future::{ready, LocalBoxFuture, Ready};
 use futures_util::TryStreamExt;
 use std::{rc::Rc, sync::Arc};
 use tokio::sync::RwLock;
-use alterion_ecdh::{KeyStore, ecdh};
+use alterion_ecdh::{KeyStore, HandshakeStore, ecdh, ecdh_ephemeral};
+use redis::aio::ConnectionManager;
 use crate::tools::crypt::aes_decrypt;
 use crate::tools::serializer::{deserialize_packet, build_signed_response_raw, derive_session_keys, verify_packet_mac};
+use zeroize::ZeroizeOnDrop;
 
 /// Injected into request extensions after successful decryption of an encrypted request body.
 #[derive(Clone)]
@@ -18,7 +20,9 @@ pub struct DecryptedBody(pub Vec<u8>);
 
 /// Injected alongside `DecryptedBody`; carries the derived per-request session keys so the
 /// response can be encrypted with the same keys the client derived.
-#[derive(Clone)]
+///
+/// Both fields are zeroized on drop — keys do not linger on the heap after the response is sent.
+#[derive(Clone, ZeroizeOnDrop)]
 pub struct RequestSessionKeys {
     pub enc_key: [u8; 32],
     pub mac_key: [u8; 32],
@@ -30,10 +34,12 @@ pub struct RequestSessionKeys {
 /// # Usage
 /// ```rust,no_run
 /// use alterion_encrypt::interceptor::Interceptor;
-/// use alterion_encrypt::init_key_store;
+/// use alterion_encrypt::{init_key_store, init_handshake_store, start_rotation};
 ///
 /// let store = init_key_store(3600);
-/// // App::new().wrap(Interceptor { key_store: store })
+/// let hs    = init_handshake_store();
+/// start_rotation(store.clone(), 3600, hs.clone());
+/// // App::new().wrap(Interceptor { key_store: store, handshake_store: hs, replay_store: None })
 /// ```
 ///
 /// **Request path** (POST / PUT / PATCH):
@@ -51,7 +57,12 @@ pub struct RequestSessionKeys {
 /// **Response path** (only when `RequestSessionKeys` was set):
 /// Deflate-compress → msgpack → AES-256-GCM (enc_key) → HMAC-SHA256 (mac_key) → msgpack.
 pub struct Interceptor {
-    pub key_store: Arc<RwLock<KeyStore>>,
+    pub key_store:      Arc<RwLock<KeyStore>>,
+    /// Ephemeral handshake store for forward-secret per-request ECDH.
+    pub handshake_store: HandshakeStore,
+    /// When `Some`, each packet's MAC hex is stored in Redis with `SETNX` to reject replays
+    /// within the 30-second timestamp window. `None` disables the check (dev/test only).
+    pub replay_store:   Option<ConnectionManager>,
 }
 
 impl<S, B> Transform<S, ServiceRequest> for Interceptor
@@ -67,15 +78,19 @@ where
 
     fn new_transform(&self, service: S) -> Self::Future {
         ready(Ok(InterceptorService {
-            service:   Rc::new(service),
-            key_store: self.key_store.clone(),
+            service:         Rc::new(service),
+            key_store:       self.key_store.clone(),
+            handshake_store: self.handshake_store.clone(),
+            replay_store:    self.replay_store.clone(),
         }))
     }
 }
 
 pub struct InterceptorService<S> {
-    service:   Rc<S>,
-    key_store: Arc<RwLock<KeyStore>>,
+    service:         Rc<S>,
+    key_store:       Arc<RwLock<KeyStore>>,
+    handshake_store: HandshakeStore,
+    replay_store:    Option<ConnectionManager>,
 }
 
 impl<S, B> Service<ServiceRequest> for InterceptorService<S>
@@ -90,8 +105,10 @@ where
     forward_ready!(service);
 
     fn call(&self, mut req: ServiceRequest) -> Self::Future {
-        let service   = self.service.clone();
-        let key_store = self.key_store.clone();
+        let service         = self.service.clone();
+        let key_store       = self.key_store.clone();
+        let handshake_store = self.handshake_store.clone();
+        let replay_store    = self.replay_store.clone();
 
         Box::pin(async move {
             let has_body = !matches!(req.method().as_str(), "GET" | "HEAD" | "OPTIONS");
@@ -113,11 +130,16 @@ where
                                 .try_into()
                                 .map_err(|_| actix_web::error::ErrorBadRequest("client_pk must be 32 bytes"))?;
 
-                            let (shared_secret, server_pk) = ecdh(
-                                &key_store, &packet.key_id, &client_pk_bytes,
-                            )
-                            .await
-                            .map_err(|e| actix_web::error::ErrorUnauthorized(e.to_string()))?;
+                            let (shared_secret, server_pk) =
+                                if packet.key_id.starts_with("hs_") {
+                                    ecdh_ephemeral(&handshake_store, &packet.key_id, &client_pk_bytes)
+                                        .await
+                                        .map_err(|e| actix_web::error::ErrorUnauthorized(e.to_string()))?
+                                } else {
+                                    ecdh(&key_store, &packet.key_id, &client_pk_bytes)
+                                        .await
+                                        .map_err(|e| actix_web::error::ErrorUnauthorized(e.to_string()))?
+                                };
 
                             let (enc_key, mac_key) = derive_session_keys(
                                 shared_secret.as_ref().try_into().unwrap(),
@@ -127,6 +149,20 @@ where
 
                             if !verify_packet_mac(&mac_key, &packet) {
                                 return Err(actix_web::error::ErrorUnauthorized("packet mac invalid"));
+                            }
+
+                            if let Some(mut redis) = replay_store {
+                                let mac_hex  = hex::encode(packet.mac.as_ref());
+                                let seen_key = format!("replay:seen:{}", mac_hex);
+                                let is_new: bool = redis::cmd("SET")
+                                    .arg(&seen_key).arg(1u8)
+                                    .arg("NX").arg("EX").arg(60u64)
+                                    .query_async(&mut redis).await
+                                    .map(|v: Option<String>| v.is_some())
+                                    .unwrap_or(true);
+                                if !is_new {
+                                    return Err(actix_web::error::ErrorUnauthorized("replay detected"));
+                                }
                             }
 
                             let decrypted = aes_decrypt(packet.data.as_ref(), &enc_key)
