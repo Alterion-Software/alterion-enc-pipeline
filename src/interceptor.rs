@@ -8,26 +8,29 @@ use futures_util::future::{ready, LocalBoxFuture, Ready};
 use futures_util::TryStreamExt;
 use std::{rc::Rc, sync::Arc};
 use tokio::sync::RwLock;
-use alterion_rsa_key_manager::{KeyStore, decrypt as rsa_decrypt};
+use alterion_key_exchange::{KeyStore, ecdh};
 use crate::tools::crypt::aes_decrypt;
-use crate::tools::serializer::{deserialize_packet, build_signed_response_raw};
+use crate::tools::serializer::{deserialize_packet, build_signed_response_raw, derive_session_keys, verify_packet_mac};
 
 /// Injected into request extensions after successful decryption of an encrypted request body.
 #[derive(Clone)]
 pub struct DecryptedBody(pub Vec<u8>);
 
-/// Injected alongside `DecryptedBody`; carries the per-request AES key so the response
-/// can be encrypted with the same key the client used.
+/// Injected alongside `DecryptedBody`; carries the derived per-request session keys so the
+/// response can be encrypted with the same keys the client derived.
 #[derive(Clone)]
-pub struct RequestAesKey(pub [u8; 32]);
+pub struct RequestSessionKeys {
+    pub enc_key: [u8; 32],
+    pub mac_key: [u8; 32],
+}
 
 /// Actix-web middleware that transparently decrypts incoming request bodies and encrypts outgoing
-/// response bodies using the RSA + AES-256-GCM + HMAC-SHA256 pipeline.
+/// response bodies using the X25519 ECDH + AES-256-GCM + HMAC-SHA256 pipeline.
 ///
 /// # Usage
 /// ```rust,no_run
 /// use alterion_enc_pipeline::interceptor::Interceptor;
-/// use alterion_enc_pipeline::keystore::init_key_store;
+/// use alterion_key_exchange::init_key_store;
 ///
 /// let store = init_key_store(3600);
 /// // App::new().wrap(Interceptor { key_store: store })
@@ -35,15 +38,18 @@ pub struct RequestAesKey(pub [u8; 32]);
 ///
 /// **Request path** (POST / PUT / PATCH):
 /// 1. Collect raw body bytes.
-/// 2. MessagePack-decode a `WrappedPacket`.
-/// 3. RSA-OAEP-SHA256-decrypt the wrapped AES key via the active `KeyStore` entry.
-/// 4. AES-256-GCM-decrypt the payload.
-/// 5. Inject `DecryptedBody` and `RequestAesKey` into request extensions.
+/// 2. MessagePack-decode a `WrappedPacket` and validate timestamp.
+/// 3. Perform X25519 ECDH using the server key identified by `key_id` and the client's ephemeral
+///    public key from the packet.
+/// 4. Derive `enc_key` and `mac_key` via HKDF-SHA256 bound to both public keys.
+/// 5. Verify the packet MAC over `key_id || ts || client_pk || data`.
+/// 6. AES-256-GCM-decrypt the payload using `enc_key`.
+/// 7. Inject `DecryptedBody` and `RequestSessionKeys` into request extensions.
 ///
 /// Requests whose body is not a valid `WrappedPacket` are passed through unchanged.
 ///
-/// **Response path** (only when `RequestAesKey` was set):
-/// Deflate-compress → msgpack → AES-256-GCM → HMAC-SHA256 → msgpack the response body.
+/// **Response path** (only when `RequestSessionKeys` was set):
+/// Deflate-compress → msgpack → AES-256-GCM (enc_key) → HMAC-SHA256 (mac_key) → msgpack.
 pub struct Interceptor {
     pub key_store: Arc<RwLock<KeyStore>>,
 }
@@ -94,8 +100,7 @@ where
                 let mut payload = req.take_payload();
                 let mut raw = web::BytesMut::new();
                 while let Some(chunk) = payload
-                    .try_next()
-                    .await
+                    .try_next().await
                     .map_err(actix_web::error::ErrorBadRequest)?
                 {
                     raw.extend_from_slice(&chunk);
@@ -104,21 +109,31 @@ where
                 if !raw.is_empty() {
                     match deserialize_packet(&raw) {
                         Ok(packet) => {
-                            let aes_key_bytes = rsa_decrypt(
-                                &key_store, &packet.key_id, packet.cdata.as_ref(),
+                            let client_pk_bytes: [u8; 32] = packet.client_pk.as_ref()
+                                .try_into()
+                                .map_err(|_| actix_web::error::ErrorBadRequest("client_pk must be 32 bytes"))?;
+
+                            let (shared_secret, server_pk) = ecdh(
+                                &key_store, &packet.key_id, &client_pk_bytes,
                             )
                             .await
                             .map_err(|e| actix_web::error::ErrorUnauthorized(e.to_string()))?;
 
-                            let aes_key: [u8; 32] = aes_key_bytes.as_slice()
-                                .try_into()
-                                .map_err(|_| actix_web::error::ErrorBadRequest("aes key length"))?;
+                            let (enc_key, mac_key) = derive_session_keys(
+                                shared_secret.as_ref().try_into().unwrap(),
+                                &client_pk_bytes,
+                                &server_pk,
+                            );
 
-                            let decrypted = aes_decrypt(packet.data.as_ref(), &aes_key)
+                            if !verify_packet_mac(&mac_key, &packet) {
+                                return Err(actix_web::error::ErrorUnauthorized("packet mac invalid"));
+                            }
+
+                            let decrypted = aes_decrypt(packet.data.as_ref(), &enc_key)
                                 .map_err(|e| actix_web::error::ErrorBadRequest(e.to_string()))?;
 
                             req.extensions_mut().insert(DecryptedBody(decrypted));
-                            req.extensions_mut().insert(RequestAesKey(aes_key));
+                            req.extensions_mut().insert(RequestSessionKeys { enc_key, mac_key });
                         }
                         Err(_) => {
                             let frozen: actix_web::web::Bytes = raw.freeze();
@@ -130,11 +145,11 @@ where
                 }
             }
 
-            let aes_key = req.extensions().get::<RequestAesKey>().cloned();
-            let res     = service.call(req).await?;
+            let session_keys = req.extensions().get::<RequestSessionKeys>().cloned();
+            let res          = service.call(req).await?;
 
-            let aes_key = match aes_key {
-                Some(k) => k.0,
+            let session_keys = match session_keys {
+                Some(k) => k,
                 None    => return Ok(res.map_into_left_body()),
             };
 
@@ -145,7 +160,9 @@ where
                 .await
                 .map_err(|_| actix_web::error::ErrorInternalServerError("body collect failed"))?;
 
-            let encrypted = match build_signed_response_raw(&body_bytes, &aes_key) {
+            let encrypted = match build_signed_response_raw(
+                &body_bytes, &session_keys.enc_key, &session_keys.mac_key,
+            ) {
                 Ok(b)  => b,
                 Err(e) => {
                     tracing::error!("response encrypt: {e}");

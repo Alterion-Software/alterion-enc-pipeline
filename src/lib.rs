@@ -42,7 +42,7 @@
 pub mod interceptor;
 pub mod tools;
 
-pub use alterion_rsa_key_manager::{
-    KeyStore, KeyEntry, RsaError,
-    init_key_store, start_rotation, get_current_public_key, decrypt,
+pub use alterion_key_exchange::{
+    KeyStore, KeyEntry, EcdhError,
+    init_key_store, start_rotation, get_current_public_key, ecdh,
 };
