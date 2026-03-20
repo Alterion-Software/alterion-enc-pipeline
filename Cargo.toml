@@ -9,7 +9,7 @@ repository = "https://github.com/Alterion-Software/alterion-encrypt"
 
 [dependencies]
 # RSA key store
-alterion-ecdh = { path = "../rsa-key-manager" }
+alterion-ecdh = "0.3"
 
 # Symmetric crypto
 aes-gcm = "0.10"
