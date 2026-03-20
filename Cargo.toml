@@ -9,7 +9,7 @@ repository = "https://github.com/Alterion-Software/alterion-enc-pipeline"
 
 [dependencies]
 # RSA key store
-alterion-ecdh = { path = "../rsa-key-manager" }
+alterion-ecdh = "0.1"
 
 # Symmetric crypto
 aes-gcm = "0.10"
