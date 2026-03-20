@@ -1,6 +1,6 @@
 [package]
 name = "alterion-encrypt"
-version = "1.1.0"
+version = "1.2.0"
 authors = ["Alterion Software"]
 edition = "2024"
 description = "X25519 ECDH key exchange, AES-256-GCM session encryption, Argon2id password hashing, and the MessagePack/deflate request-response pipeline with an Actix-web interceptor."
@@ -9,7 +9,7 @@ repository = "https://github.com/Alterion-Software/alterion-encrypt"
 
 [dependencies]
 # RSA key store
-alterion-ecdh = "0.1"
+alterion-ecdh = "0.2"
 
 # Symmetric crypto
 aes-gcm = "0.10"
