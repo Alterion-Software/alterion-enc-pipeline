@@ -1,9 +1,9 @@
 [package]
 name = "alterion-enc-pipeline"
-version = "0.2.0"
+version = "1.1.0"
 authors = ["Alterion Software"]
 edition = "2024"
-description = "RSA key rotation, AES-256-GCM session encryption, Argon2id password hashing, and the MessagePack/deflate request-response pipeline with an Actix-web interceptor."
+description = "X25519 ECDH key exchange, AES-256-GCM session encryption, Argon2id password hashing, and the MessagePack/deflate request-response pipeline with an Actix-web interceptor."
 license = "GPL-3.0"
 repository = "https://github.com/Alterion-Software/alterion-enc-pipeline"
 
