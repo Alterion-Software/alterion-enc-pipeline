@@ -17,6 +17,8 @@
 
 _A full end-to-end encryption pipeline for Actix-web — X25519 ECDH key exchange, AES-256-GCM session encryption, Argon2id password hashing, and a MessagePack + Deflate request/response pipeline, all behind a single middleware._
 
+> **JavaScript/TypeScript client?** See [alterion-encrypt-js](https://github.com/Alterion-Software/alterion-encrypt-js) — the framework-agnostic JS counterpart implementing the same wire protocol.
+
 ---
 
 </div>
