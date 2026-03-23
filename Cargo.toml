@@ -9,7 +9,8 @@ repository = "https://github.com/Alterion-Software/alterion-encrypt"
 
 [dependencies]
 # RSA key store
-alterion-ecdh = "0.3"
+alterion-ecdh  = "0.3"
+x25519-dalek   = "2"
 
 # Symmetric crypto
 aes-gcm = "0.10"
