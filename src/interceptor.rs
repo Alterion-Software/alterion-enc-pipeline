@@ -11,21 +11,18 @@ use tokio::sync::RwLock;
 use alterion_ecdh::{KeyStore, HandshakeStore, ecdh, ecdh_ephemeral};
 use redis::aio::ConnectionManager;
 use crate::tools::crypt::aes_decrypt;
-use crate::tools::serializer::{deserialize_packet, build_signed_response_raw, derive_session_keys, verify_packet_mac};
+use crate::tools::serializer::{deserialize_packet, build_signed_response_raw, derive_wrap_key};
 use zeroize::ZeroizeOnDrop;
 
 /// Injected into request extensions after successful decryption of an encrypted request body.
 #[derive(Clone)]
 pub struct DecryptedBody(pub Vec<u8>);
 
-/// Injected alongside `DecryptedBody`; carries the derived per-request session keys so the
-/// response can be encrypted with the same keys the client derived.
-///
-/// Both fields are zeroized on drop — keys do not linger on the heap after the response is sent.
+/// Injected alongside `DecryptedBody`; carries the per-request AES key so the response can be
+/// encrypted with the same key the client generated. Zeroized on drop.
 #[derive(Clone, ZeroizeOnDrop)]
 pub struct RequestSessionKeys {
     pub enc_key: [u8; 32],
-    pub mac_key: [u8; 32],
 }
 
 /// Actix-web middleware that transparently decrypts incoming request bodies and encrypts outgoing
@@ -44,18 +41,18 @@ pub struct RequestSessionKeys {
 ///
 /// **Request path** (POST / PUT / PATCH):
 /// 1. Collect raw body bytes.
-/// 2. MessagePack-decode a `WrappedPacket` and validate timestamp.
+/// 2. MessagePack-decode a [`Request`](crate::tools::serializer::Request) and validate timestamp.
 /// 3. Perform X25519 ECDH using the server key identified by `key_id` and the client's ephemeral
 ///    public key from the packet.
-/// 4. Derive `enc_key` and `mac_key` via HKDF-SHA256 bound to both public keys.
-/// 5. Verify the packet MAC over `key_id || ts || client_pk || data`.
-/// 6. AES-256-GCM-decrypt the payload using `enc_key`.
-/// 7. Inject `DecryptedBody` and `RequestSessionKeys` into request extensions.
+/// 4. Derive a wrap key via HKDF-SHA256 and use it to AES-GCM-unwrap the client's `enc_key`.
+/// 5. AES-256-GCM-decrypt the payload using `enc_key`.
+/// 6. Inject `DecryptedBody` and `RequestSessionKeys` into request extensions.
 ///
-/// Requests whose body is not a valid `WrappedPacket` are passed through unchanged.
+/// Requests whose body is not a valid `Request` are passed through unchanged.
 ///
 /// **Response path** (only when `RequestSessionKeys` was set):
-/// Deflate-compress → msgpack → AES-256-GCM (enc_key) → HMAC-SHA256 (mac_key) → msgpack.
+/// JSON → deflate compress → msgpack → AES-256-GCM (`enc_key`) → HMAC-SHA256 (mac key derived
+/// from `enc_key`) → [`Response`](crate::tools::serializer::Response) → msgpack.
 pub struct Interceptor {
     pub key_store:      Arc<RwLock<KeyStore>>,
     /// Ephemeral handshake store for forward-secret per-request ECDH.
@@ -141,14 +138,33 @@ where
                                         .map_err(|e| actix_web::error::ErrorUnauthorized(e.to_string()))?
                                 };
 
-                            let (enc_key, mac_key) = derive_session_keys(
-                                shared_secret.as_ref().try_into().unwrap(),
+                            let shared_bytes: &[u8; 32] = shared_secret.as_ref()
+                                .try_into()
+                                .map_err(|_| actix_web::error::ErrorInternalServerError("shared secret length invalid"))?;
+                            let wrap_key = derive_wrap_key(
+                                shared_bytes,
                                 &client_pk_bytes,
                                 &server_pk,
                             );
 
-                            if !verify_packet_mac(&mac_key, &packet) {
-                                return Err(actix_web::error::ErrorUnauthorized("packet mac invalid"));
+                            let enc_key_bytes = aes_decrypt(packet.wrapped_key.as_ref(), &wrap_key)
+                                .map_err(|e| actix_web::error::ErrorUnauthorized(e.to_string()))?;
+                            let enc_key: [u8; 32] = enc_key_bytes.as_slice()
+                                .try_into()
+                                .map_err(|_| actix_web::error::ErrorBadRequest("enc_key must be 32 bytes"))?;
+
+                            if let Some(mut redis) = replay_store {
+                                let key_hex  = hex::encode(packet.wrapped_key.as_ref());
+                                let seen_key = format!("replay:seen:{}", key_hex);
+                                let is_new: bool = redis::cmd("SET")
+                                    .arg(&seen_key).arg(1u8)
+                                    .arg("NX").arg("EX").arg(60u64)
+                                    .query_async(&mut redis).await
+                                    .map(|v: Option<String>| v.is_some())
+                                    .unwrap_or(true);
+                                if !is_new {
+                                    return Err(actix_web::error::ErrorUnauthorized("replay detected"));
+                                }
                             }
 
                             if let Some(mut redis) = replay_store {
@@ -169,7 +185,7 @@ where
                                 .map_err(|e| actix_web::error::ErrorBadRequest(e.to_string()))?;
 
                             req.extensions_mut().insert(DecryptedBody(decrypted));
-                            req.extensions_mut().insert(RequestSessionKeys { enc_key, mac_key });
+                            req.extensions_mut().insert(RequestSessionKeys { enc_key });
                         }
                         Err(_) => {
                             let frozen: actix_web::web::Bytes = raw.freeze();
@@ -197,7 +213,7 @@ where
                 .map_err(|_| actix_web::error::ErrorInternalServerError("body collect failed"))?;
 
             let encrypted = match build_signed_response_raw(
-                &body_bytes, &session_keys.enc_key, &session_keys.mac_key,
+                &body_bytes, &session_keys.enc_key,
             ) {
                 Ok(b)  => b,
                 Err(e) => {

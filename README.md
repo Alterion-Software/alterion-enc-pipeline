@@ -17,22 +17,26 @@
 
 _A full end-to-end encryption pipeline for Actix-web — X25519 ECDH key exchange, AES-256-GCM session encryption, Argon2id password hashing, and a MessagePack + Deflate request/response pipeline, all behind a single middleware._
 
+> **JavaScript/TypeScript client?** See [alterion-encrypt-js](https://github.com/Alterion-Software/alterion-encrypt-js) — the framework-agnostic JS counterpart implementing the same wire protocol.
+
 ---
 
 </div>
 
 ## What it does
 
-Each request from the client is packaged as a `WrappedPacket`:
+Each request from the client is packaged as a `Request`:
 
 ```
-Client → [AES-256-GCM encrypted body] + [ephemeral X25519 public key] + [key_id] + [timestamp] + [HMAC]
+Client → Request { data: AES-256-GCM ciphertext, client_pk: ephemeral X25519, key_id, ts, mac: HMAC }
 ```
 
 The `Interceptor` middleware:
 
 1. **Decrypts the request** — performs X25519 ECDH with the client's ephemeral key, derives `enc_key` and `mac_key` via HKDF-SHA256, verifies the packet MAC, then AES-decrypts the payload. The raw bytes are injected into request extensions as `DecryptedBody` for your handlers to read.
-2. **Encrypts the response** — Takes the JSON response body and pipes it through: `Deflate → MessagePack → AES-256-GCM → HMAC-SHA256`, returning a signed `SignedResponse` packet.
+2. **Encrypts the response** — re-encrypts the JSON response body with the **same** `enc_key` and `mac_key` derived during the request (the client already holds them). The response is `Response { payload, hmac }` — no second ECDH round-trip is needed.
+
+`build_request_packet` and `decode_response_packet` in `tools::serializer` implement the matching client-side pipeline so Rust clients can participate in the same exchange without re-implementing the protocol.
 
 The X25519 key pair rotates automatically on a configurable interval with a 300-second grace window so in-flight requests using the previous key still succeed.
 
@@ -166,11 +170,24 @@ let secret = crypt::key_decrypt(&blob, "master-password")?;
 ```rust
 use alterion_encrypt::tools::serializer;
 
-// Build an AES+HMAC signed response from any Serialize type
-let bytes = serializer::build_signed_response(&my_struct, &enc_key, &mac_key)?;
+// ── Server side ──────────────────────────────────────────────────────────────
 
-// Decode an incoming request payload (msgpack → deflate → JSON)
-let payload: MyStruct = serializer::decode_request_payload(&decrypted_bytes)?;
+// Decode an incoming request payload (msgpack → deflate decompress → JSON)
+let payload: Request = serializer::decode_request_payload(&decrypted_bytes)?;
+
+// Build an AES-encrypted, HMAC-signed response from any Serialize type
+let bytes = serializer::build_signed_response(&response, &enc_key)?;
+
+// ── Client side ──────────────────────────────────────────────────────────────
+
+// Build an encrypted request packet (JSON → compress → msgpack → AES-256-GCM → Request).
+// Returns wire bytes and the AES key — hold enc_key to decrypt the server's response.
+let (wire_bytes, enc_key) =
+    serializer::build_request_packet(&request, &server_pk, key_id)?;
+
+// Decode and verify a server Response using the AES key from build_request_packet.
+let response: Response =
+    serializer::decode_response_packet(&wire_bytes, &enc_key)?;
 ```
 
 ### `tools::helper`
@@ -193,7 +210,43 @@ let new_version       = pstore::rotate_pepper()?;
 
 ---
 
-## Response pipeline
+## Pipelines
+
+### Client request (`build_request_packet`)
+
+```
+Any Serialize value
+        │
+        ▼
+  serde_json::to_vec
+        │
+        ▼
+  Deflate compress
+        │
+        ▼
+  MessagePack encode  ──→  ByteBuf
+        │
+        ▼
+  AES-256-GCM encrypt  (random enc_key — stored client-side by request ID)
+        │
+        ▼
+  Ephemeral X25519 keygen  ──→  ECDH(client_sk, server_pk)  ──→  HKDF-SHA256  ──→  wrap_key
+        │
+        ▼
+  AES-256-GCM wrap enc_key  (wrap_key)  ──→  wrapped_key
+        │
+        ▼
+  Request { data, wrapped_key, client_pk, key_id, ts }
+        │
+        ▼
+  MessagePack encode  ──→  wire bytes
+```
+
+`enc_key` is returned to the caller and must be stored client-side (e.g. keyed by request ID).
+The `wrapped_key` lets the server recover `enc_key` via ECDH without it ever appearing in plain
+text on the wire. AES-GCM authentication tags on both `data` and `wrapped_key` ensure integrity.
+
+### Server response (`build_signed_response`)
 
 ```
 Handler returns JSON bytes
@@ -205,19 +258,21 @@ Handler returns JSON bytes
   MessagePack encode  ──→  ByteBuf
         │
         ▼
-  AES-256-GCM encrypt  (enc_key, nonce prepended)
+  AES-256-GCM encrypt  (enc_key — same key the client generated for the request)
         │
         ▼
-  HMAC-SHA256 sign  (mac_key, over the ciphertext)
+  HMAC-SHA256 sign  (enc_key, over the ciphertext)
         │
         ▼
-  SignedResponse { payload: ByteBuf, hmac: ByteBuf }
+  Response { payload: ByteBuf, hmac: ByteBuf }
         │
         ▼
   MessagePack encode  ──→  sent to client
 ```
 
-The client verifies the HMAC before decrypting. If verification fails the response must be discarded.
+The client uses `enc_key` (retrieved by request ID) to verify the HMAC and decrypt via
+`decode_response_packet`. No second ECDH round-trip is needed. If HMAC verification fails
+the response must be discarded.
 
 ---
 
