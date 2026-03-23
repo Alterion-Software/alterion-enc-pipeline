@@ -167,6 +167,20 @@ where
                                 }
                             }
 
+                            if let Some(mut redis) = replay_store {
+                                let mac_hex  = hex::encode(packet.mac.as_ref());
+                                let seen_key = format!("replay:seen:{}", mac_hex);
+                                let is_new: bool = redis::cmd("SET")
+                                    .arg(&seen_key).arg(1u8)
+                                    .arg("NX").arg("EX").arg(60u64)
+                                    .query_async(&mut redis).await
+                                    .map(|v: Option<String>| v.is_some())
+                                    .unwrap_or(true);
+                                if !is_new {
+                                    return Err(actix_web::error::ErrorUnauthorized("replay detected"));
+                                }
+                            }
+
                             let decrypted = aes_decrypt(packet.data.as_ref(), &enc_key)
                                 .map_err(|e| actix_web::error::ErrorBadRequest(e.to_string()))?;
 
