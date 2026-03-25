@@ -28,12 +28,12 @@ _A full end-to-end encryption pipeline for Actix-web — X25519 ECDH key exchang
 Each request from the client is packaged as a `Request`:
 
 ```
-Client → Request { data: AES-256-GCM ciphertext, wrapped_key, client_pk: ephemeral X25519, key_id, ts }
+Client → Request { data: AES-256-GCM ciphertext, kx, client_pk: ephemeral X25519, key_id, ts }
 ```
 
 The `Interceptor` middleware:
 
-1. **Decrypts the request** — performs X25519 ECDH with the client's ephemeral key, derives a `wrap_key` via HKDF-SHA256, uses it to unwrap the client's randomly-generated `enc_key` from `wrapped_key`, then AES-GCM-decrypts the payload. The raw bytes are injected into request extensions as `DecryptedBody` for your handlers to read.
+1. **Decrypts the request** — performs X25519 ECDH with the client's ephemeral key, derives a `wrap_key` via HKDF-SHA256, uses it to unwrap the client's randomly-generated `enc_key` from `kx`, then AES-GCM-decrypts the payload. The raw bytes are injected into request extensions as `DecryptedBody` for your handlers to read.
 2. **Encrypts the response** — re-encrypts the JSON response body with the **same** `enc_key` the client generated. A separate HMAC key is derived from `enc_key` via HKDF and used to sign the ciphertext. The response is `Response { payload, hmac }` — no second ECDH round-trip is needed.
 
 `build_request_packet` and `decode_response_packet` in `tools::serializer` implement the matching client-side pipeline so Rust clients can participate in the same exchange without re-implementing the protocol.
@@ -234,18 +234,18 @@ Any Serialize value
   Ephemeral X25519 keygen  ──→  ECDH(client_sk, server_pk)  ──→  HKDF-SHA256  ──→  wrap_key
         │
         ▼
-  AES-256-GCM wrap enc_key  (wrap_key)  ──→  wrapped_key
+  AES-256-GCM wrap enc_key  (wrap_key)  ──→  kx
         │
         ▼
-  Request { data, wrapped_key, client_pk, key_id, ts }
+  Request { data, kx, client_pk, key_id, ts }
         │
         ▼
   MessagePack encode  ──→  wire bytes
 ```
 
 `enc_key` is returned to the caller and must be stored client-side (e.g. keyed by request ID).
-The `wrapped_key` lets the server recover `enc_key` via ECDH without it ever appearing in plain
-text on the wire. AES-GCM authentication tags on both `data` and `wrapped_key` ensure integrity.
+The `kx` lets the server recover `enc_key` via ECDH without it ever appearing in plain
+text on the wire. AES-GCM authentication tags on both `data` and `kx` ensure integrity.
 
 ### Server response (`build_signed_response`)
 

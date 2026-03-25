@@ -47,19 +47,16 @@ fn derive_response_mac_key(enc_key: &[u8; 32]) -> [u8; 32] {
 
 /// Outgoing encrypted request packet produced by [`build_request_packet`].
 ///
-/// `data` is the AES-256-GCM-encrypted payload. `wrapped_key` is the client's randomly-generated
-/// AES key encrypted with the ECDH-derived wrap key — the server unwraps it via ECDH then uses it
-/// to decrypt `data`. Integrity is provided by the AES-GCM authentication tags on both fields.
+/// `data` holds the AES-256-GCM ciphertext. `kx` is the session key material encrypted under the
+/// ECDH-derived wrap key; the server recovers it via ECDH to decrypt `data`. `client_pk` is the
+/// ephemeral X25519 public key. Integrity is guaranteed by the AES-GCM tags on both fields.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
-    pub data:        ByteBuf,
-    /// Client's randomly-generated AES-256 key, wrapped with the ECDH-derived wrap key.
-    pub wrapped_key: ByteBuf,
-    /// Client's ephemeral X25519 public key (32 bytes). Used server-side to perform ECDH.
-    pub client_pk:   ByteBuf,
-    pub key_id:      String,
-    /// Unix timestamp (seconds) set by the client. Validated server-side within ±30 seconds.
-    pub ts:          i64,
+    pub data:      ByteBuf,
+    pub kx:        ByteBuf,
+    pub client_pk: ByteBuf,
+    pub key_id:    String,
+    pub ts:        i64,
 }
 
 /// Encrypted response packet produced by [`build_signed_response_raw`].
@@ -222,7 +219,7 @@ pub fn build_request_packet<T: Serialize>(
     let client_pk_bytes = client_pk.to_bytes();
 
     let wrap_key    = derive_wrap_key(shared.as_bytes(), &client_pk_bytes, server_pk);
-    let wrapped_key = aes_encrypt(&enc_key, &wrap_key)
+    let kx = aes_encrypt(&enc_key, &wrap_key)
         .map_err(|e| SerializerError::Serialize(e.to_string()))?;
 
     let ts = std::time::SystemTime::now()
@@ -232,7 +229,7 @@ pub fn build_request_packet<T: Serialize>(
 
     let packet = Request {
         data:        ByteBuf::from(encrypted),
-        wrapped_key: ByteBuf::from(wrapped_key),
+        kx: ByteBuf::from(kx),
         client_pk:   ByteBuf::from(client_pk_bytes.to_vec()),
         key_id,
         ts,
@@ -349,7 +346,7 @@ mod tests {
         let shared                    = server_sk.diffie_hellman(&client_pub);
         let wrap_key                  = derive_wrap_key(shared.as_bytes(), &client_pk_bytes, &server_pk_bytes);
 
-        let enc_key_bytes             = aes_decrypt(packet.wrapped_key.as_ref(), &wrap_key).unwrap();
+        let enc_key_bytes             = aes_decrypt(packet.kx.as_ref(), &wrap_key).unwrap();
         let srv_enc_key: [u8; 32]     = enc_key_bytes.as_slice().try_into().unwrap();
         assert_eq!(client_enc_key, srv_enc_key);
 
