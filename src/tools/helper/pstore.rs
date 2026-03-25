@@ -1,60 +1,106 @@
 // SPDX-License-Identifier: GPL-3.0
-//! Cross-platform pepper store backed by the OS native keyring (Secret Service on Linux,
-//! Keychain on macOS, Credential Manager on Windows) via the [`keyring`] crate.
+//! Cross-platform pepper store.
 //!
-//! Peppers are 32 random bytes stored as lowercase hex strings under the service name
-//! `"alterion-enc-pipeline"` and a versioned key name such as `"alterion_pepper_v1"`.
-//! The active version number is tracked in the keyring under `"alterion_pepper_current_v"`
-//! so that [`rotate_pepper`] correctly advances beyond v2.
+//! **Default** — backed by the Linux kernel keyring via [`keyutils`].  No D-Bus or Secret
+//! Service daemon is required; works on any kernel ≥ 2.6.10.
+//!
+//! **Windows** (`features = ["win64"]`) — backed by Windows Credential Manager via the
+//! [`keyring`] crate.  Enable this when building for Windows targets.
+//!
+//! Peppers are 32 random bytes stored as lowercase hex strings.  A version pointer key tracks
+//! the current active version so that [`rotate_pepper`] advances correctly beyond v2.
 
-use keyring::Entry;
 use zeroize::Zeroizing;
 
-const SERVICE:              &str = "alterion-enc-pipeline";
-const PEPPER_KEY_PREFIX:    &str = "alterion_pepper_v";
-const VERSION_POINTER_KEY:  &str = "alterion_pepper_current_v";
+const SERVICE:             &str = "alterion-enc-pipeline";
+const PEPPER_KEY_PREFIX:   &str = "alterion_pepper_v";
+const VERSION_POINTER_KEY: &str = "alterion_pepper_current_v";
 
 #[derive(Debug, thiserror::Error)]
 pub enum PstoreError {
-    #[error("keyring error: {0}")]
-    KeyringError(String),
+    #[error("keystore error: {0}")]
+    KeystoreError(String),
     #[error("invalid pepper encoding")]
     InvalidEncoding,
     #[error("invalid pepper length — expected 32 bytes")]
     InvalidLength,
 }
 
+// ── Linux kernel keyring backend (default) ──────────────────────────────────
+
+#[cfg(not(feature = "win64"))]
+fn store_get(key: &str) -> Result<Option<String>, PstoreError> {
+    use keyutils::{Keyring, SpecialKeyring, keytypes::User};
+
+    let ring = Keyring::attach_or_create(SpecialKeyring::User)
+        .map_err(|e| PstoreError::KeystoreError(e.to_string()))?;
+    let desc = format!("{}:{}", SERVICE, key);
+
+    match ring.search_for_key::<User, _, _>(desc.as_str(), None) {
+        Ok(k) => {
+            let bytes = k.read()
+                .map_err(|e| PstoreError::KeystoreError(e.to_string()))?;
+            Ok(Some(String::from_utf8(bytes)
+                .map_err(|_| PstoreError::InvalidEncoding)?))
+        }
+        Err(e) if e.0 == libc::ENOKEY => Ok(None),
+        Err(e) => Err(PstoreError::KeystoreError(e.to_string())),
+    }
+}
+
+#[cfg(not(feature = "win64"))]
+fn store_set(key: &str, value: &str) -> Result<(), PstoreError> {
+    use keyutils::{Keyring, SpecialKeyring, keytypes::User};
+
+    let mut ring = Keyring::attach_or_create(SpecialKeyring::User)
+        .map_err(|e| PstoreError::KeystoreError(e.to_string()))?;
+    let desc = format!("{}:{}", SERVICE, key);
+
+    ring.add_key::<User, _, _>(desc.as_str(), value.as_bytes())
+        .map_err(|e| PstoreError::KeystoreError(e.to_string()))?;
+    Ok(())
+}
+
+// ── Windows Credential Manager backend (feature = "win64") ──────────────────
+
+#[cfg(feature = "win64")]
+fn store_get(key: &str) -> Result<Option<String>, PstoreError> {
+    use keyring::Entry;
+
+    let entry = Entry::new(SERVICE, key)
+        .map_err(|e| PstoreError::KeystoreError(e.to_string()))?;
+    match entry.get_password() {
+        Ok(s)                        => Ok(Some(s)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e)                       => Err(PstoreError::KeystoreError(e.to_string())),
+    }
+}
+
+#[cfg(feature = "win64")]
+fn store_set(key: &str, value: &str) -> Result<(), PstoreError> {
+    use keyring::Entry;
+
+    Entry::new(SERVICE, key)
+        .map_err(|e| PstoreError::KeystoreError(e.to_string()))?
+        .set_password(value)
+        .map_err(|e| PstoreError::KeystoreError(e.to_string()))
+}
+
+// ── Shared logic ─────────────────────────────────────────────────────────────
+
 fn key_name(version: i16) -> String {
     format!("{}{}", PEPPER_KEY_PREFIX, version)
 }
 
-fn entry(version: i16) -> Result<Entry, PstoreError> {
-    Entry::new(SERVICE, &key_name(version))
-        .map_err(|e| PstoreError::KeyringError(e.to_string()))
-}
-
-fn version_pointer_entry() -> Result<Entry, PstoreError> {
-    Entry::new(SERVICE, VERSION_POINTER_KEY)
-        .map_err(|e| PstoreError::KeyringError(e.to_string()))
-}
-
-/// Reads the current active pepper version from the keyring.
-/// Initialises to v1 and stores the pointer if no pointer exists yet.
 fn read_current_version() -> Result<i16, PstoreError> {
-    let e = version_pointer_entry()?;
-    match e.get_password() {
-        Ok(s) => s.trim().parse::<i16>().map_err(|_| PstoreError::InvalidEncoding),
-        Err(_) => {
-            set_current_version(1)?;
-            Ok(1)
-        }
+    match store_get(VERSION_POINTER_KEY)? {
+        Some(s) => s.trim().parse::<i16>().map_err(|_| PstoreError::InvalidEncoding),
+        None    => { set_current_version(1)?; Ok(1) }
     }
 }
 
 fn set_current_version(version: i16) -> Result<(), PstoreError> {
-    version_pointer_entry()?
-        .set_password(&version.to_string())
-        .map_err(|e| PstoreError::KeyringError(e.to_string()))
+    store_set(VERSION_POINTER_KEY, &version.to_string())
 }
 
 /// Returns the current pepper bytes and version number, generating and storing one if absent.
@@ -63,24 +109,21 @@ pub fn get_current_pepper() -> Result<([u8; 32], i16), PstoreError> {
     get_pepper(version).map(|p| (p, version))
 }
 
-/// Retrieves a specific pepper version from the OS keyring, generating and storing one if absent.
+/// Retrieves a specific pepper version from the keystore, generating and storing one if absent.
 pub fn get_pepper(version: i16) -> Result<[u8; 32], PstoreError> {
-    let e = entry(version)?;
-    match e.get_password() {
-        Ok(hex_str) => {
+    match store_get(&key_name(version))? {
+        Some(hex_str) => {
             let raw = Zeroizing::new(
                 hex::decode(&hex_str).map_err(|_| PstoreError::InvalidEncoding)?
             );
-            if raw.len() != 32 {
-                return Err(PstoreError::InvalidLength);
-            }
+            if raw.len() != 32 { return Err(PstoreError::InvalidLength); }
             let mut out = [0u8; 32];
             out.copy_from_slice(&raw);
             Ok(out)
         }
-        Err(_) => {
+        None => {
             let pepper = generate_pepper();
-            store_pepper(version, &pepper)?;
+            store_set(&key_name(version), &hex::encode(&pepper))?;
             Ok(pepper)
         }
     }
@@ -92,18 +135,12 @@ fn generate_pepper() -> [u8; 32] {
     buf
 }
 
-fn store_pepper(version: i16, pepper: &[u8; 32]) -> Result<(), PstoreError> {
-    entry(version)?
-        .set_password(&hex::encode(pepper))
-        .map_err(|e| PstoreError::KeyringError(e.to_string()))
-}
-
 /// Generates a new pepper at `current_version + 1`, stores it, advances the version pointer,
 /// and returns the new version number.
 pub fn rotate_pepper() -> Result<i16, PstoreError> {
     let current     = read_current_version()?;
     let new_version = current + 1;
-    store_pepper(new_version, &generate_pepper())?;
+    store_set(&key_name(new_version), &hex::encode(&generate_pepper()))?;
     set_current_version(new_version)?;
     Ok(new_version)
 }
