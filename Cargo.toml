@@ -9,15 +9,15 @@ repository = "https://github.com/Alterion-Software/alterion-encrypt"
 
 [dependencies]
 # RSA key store
-alterion-ecdh  = "0.3"
+alterion-ecdh  = "1.0"
 x25519-dalek   = "2"
 
 # Symmetric crypto
 aes-gcm = "0.10"
 argon2  = "0.5"
-hmac    = "0.12"
-sha2    = "0.10"
-hkdf    = "0.12"
+hmac    = "0.13"
+sha2    = "0.11"
+hkdf    = "0.13"
 subtle  = "2"
 
 # Encoding
@@ -32,7 +32,7 @@ rmp-serde   = "1.3"
 flate2      = "1"
 
 # Pepper key store — OS native keyring (Secret Service / Keychain / Credential Manager)
-keyring = "2"
+keyring = "3"
 
 # Actix (interceptor middleware)
 actix-web  = "4"
@@ -51,4 +51,4 @@ uuid      = { version = "1", features = ["v4"] }
 thiserror = "2"
 tracing   = "0.1"
 anyhow    = "1"
-redis     = { version = "0.28", features = ["tokio-comp", "connection-manager"] }
+redis     = { version = "1.2", features = ["tokio-comp", "connection-manager"] }
