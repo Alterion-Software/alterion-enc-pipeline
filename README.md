@@ -14,6 +14,7 @@
 [![Actix-web](https://img.shields.io/badge/Actix--web-4-green?style=flat)](https://actix.rs/)
 [![AES-256-GCM](https://img.shields.io/badge/AES--256--GCM-Encrypted-blue?style=flat)](https://docs.rs/aes-gcm)
 [![GitHub](https://img.shields.io/badge/GitHub-Alterion--Software-181717?style=flat&logo=github&logoColor=white)](https://github.com/Alterion-Software)
+[![Socket Badge](https://badge.socket.dev/cargo/package/alterion-encrypt/1.3.2)](https://badge.socket.dev/cargo/package/alterion-encrypt/1.3.2)
 
 _A full end-to-end encryption pipeline for Actix-web — X25519 ECDH key exchange, AES-256-GCM session encryption, Argon2id password hashing, and a MessagePack + Deflate request/response pipeline, all behind a single middleware._
 
@@ -28,13 +29,13 @@ _A full end-to-end encryption pipeline for Actix-web — X25519 ECDH key exchang
 Each request from the client is packaged as a `Request`:
 
 ```
-Client → Request { data: AES-256-GCM ciphertext, client_pk: ephemeral X25519, key_id, ts, mac: HMAC }
+Client → Request { data: AES-256-GCM ciphertext, kx, client_pk: ephemeral X25519, key_id, ts }
 ```
 
 The `Interceptor` middleware:
 
-1. **Decrypts the request** — performs X25519 ECDH with the client's ephemeral key, derives `enc_key` and `mac_key` via HKDF-SHA256, verifies the packet MAC, then AES-decrypts the payload. The raw bytes are injected into request extensions as `DecryptedBody` for your handlers to read.
-2. **Encrypts the response** — re-encrypts the JSON response body with the **same** `enc_key` and `mac_key` derived during the request (the client already holds them). The response is `Response { payload, hmac }` — no second ECDH round-trip is needed.
+1. **Decrypts the request** — performs X25519 ECDH with the client's ephemeral key, derives a `wrap_key` via HKDF-SHA256, uses it to unwrap the client's randomly-generated `enc_key` from `kx`, then AES-GCM-decrypts the payload. The raw bytes are injected into request extensions as `DecryptedBody` for your handlers to read.
+2. **Encrypts the response** — re-encrypts the JSON response body with the **same** `enc_key` the client generated. A separate HMAC key is derived from `enc_key` via HKDF and used to sign the ciphertext. The response is `Response { payload, hmac }` — no second ECDH round-trip is needed.
 
 `build_request_packet` and `decode_response_packet` in `tools::serializer` implement the matching client-side pipeline so Rust clients can participate in the same exchange without re-implementing the protocol.
 
@@ -64,26 +65,27 @@ alterion_encrypt
 
 ```toml
 [dependencies]
-alterion-encrypt = "1.1"
-alterion-ecdh    = "0.1"
+alterion-encrypt = "1.3"
+alterion-ecdh    = "0.3"
 ```
 
 ### 2. Initialise the key store and mount the interceptor
 
 ```rust
 use alterion_encrypt::interceptor::Interceptor;
-use alterion_encrypt::{init_key_store, start_rotation};
+use alterion_encrypt::{init_key_store, init_handshake_store, start_rotation};
 use actix_web::{web, App, HttpServer};
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     // Rotate X25519 keys every hour; keep the previous key live for 5 minutes.
     let store = init_key_store(3600);
-    start_rotation(store.clone(), 3600);
+    let hs    = init_handshake_store();
+    start_rotation(store.clone(), 3600, hs.clone());
 
     HttpServer::new(move || {
         App::new()
-            .wrap(Interceptor { key_store: store.clone() })
+            .wrap(Interceptor { key_store: store.clone(), handshake_store: hs.clone(), replay_store: None })
             // your routes here
     })
     .bind("0.0.0.0:8080")?
@@ -186,7 +188,7 @@ let (wire_bytes, enc_key) =
     serializer::build_request_packet(&request, &server_pk, key_id)?;
 
 // Decode and verify a server Response using the AES key from build_request_packet.
-let response: Response =
+let decoded: MyResponse =
     serializer::decode_response_packet(&wire_bytes, &enc_key)?;
 ```
 
@@ -233,18 +235,18 @@ Any Serialize value
   Ephemeral X25519 keygen  ──→  ECDH(client_sk, server_pk)  ──→  HKDF-SHA256  ──→  wrap_key
         │
         ▼
-  AES-256-GCM wrap enc_key  (wrap_key)  ──→  wrapped_key
+  AES-256-GCM wrap enc_key  (wrap_key)  ──→  kx
         │
         ▼
-  Request { data, wrapped_key, client_pk, key_id, ts }
+  Request { data, kx, client_pk, key_id, ts }
         │
         ▼
   MessagePack encode  ──→  wire bytes
 ```
 
 `enc_key` is returned to the caller and must be stored client-side (e.g. keyed by request ID).
-The `wrapped_key` lets the server recover `enc_key` via ECDH without it ever appearing in plain
-text on the wire. AES-GCM authentication tags on both `data` and `wrapped_key` ensure integrity.
+The `kx` lets the server recover `enc_key` via ECDH without it ever appearing in plain
+text on the wire. AES-GCM authentication tags on both `data` and `kx` ensure integrity.
 
 ### Server response (`build_signed_response`)
 
@@ -261,7 +263,7 @@ Handler returns JSON bytes
   AES-256-GCM encrypt  (enc_key — same key the client generated for the request)
         │
         ▼
-  HMAC-SHA256 sign  (enc_key, over the ciphertext)
+  HMAC-SHA256 sign  (mac_key derived from enc_key via HKDF, over the ciphertext)
         │
         ▼
   Response { payload: ByteBuf, hmac: ByteBuf }

@@ -128,8 +128,7 @@ pub fn aes_decrypt(data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, CryptError> {
 
 /// Generates `bytes` random bytes and returns them as a lowercase hex string.
 pub fn generate_random_hex(bytes: usize) -> String {
-    let mut buf = vec![0u8; bytes];
-    rand_core::OsRng.fill_bytes(&mut buf);
+    let buf: Vec<u8> = (0..bytes).map(|_| rand::random()).collect();
     buf.iter().fold(String::with_capacity(bytes * 2), |mut acc, b| {
         use std::fmt::Write;
         let _ = write!(acc, "{:02x}", b);

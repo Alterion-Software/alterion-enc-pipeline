@@ -70,12 +70,9 @@ pub struct RequestSessionKeys {
 /// JSON → deflate compress → msgpack → AES-256-GCM (`enc_key`) → HMAC-SHA256 (mac key derived
 /// from `enc_key`) → [`Response`](crate::tools::serializer::Response) → msgpack.
 pub struct Interceptor {
-    pub key_store:      Arc<RwLock<KeyStore>>,
-    /// Ephemeral handshake store for forward-secret per-request ECDH.
+    pub key_store:       Arc<RwLock<KeyStore>>,
     pub handshake_store: HandshakeStore,
-    /// When `Some`, each packet's MAC hex is stored in Redis with `SETNX` to reject replays
-    /// within the 30-second timestamp window. `None` disables the check (dev/test only).
-    pub replay_store:   Option<ConnectionManager>,
+    pub replay_store:    Option<ConnectionManager>,
 }
 
 impl<S, B> Transform<S, ServiceRequest> for Interceptor
@@ -162,21 +159,16 @@ where
                             let shared_bytes: &[u8; 32] = shared_secret.as_ref()
                                 .try_into()
                                 .map_err(|_| actix_web::error::ErrorInternalServerError("shared secret length invalid"))?;
-                            let wrap_key = derive_wrap_key(
-                                shared_bytes,
-                                &client_pk_bytes,
-                                &server_pk,
-                            );
+                            let wrap_key = derive_wrap_key(shared_bytes, &client_pk_bytes, &server_pk);
 
-                            let enc_key_bytes = aes_decrypt(packet.wrapped_key.as_ref(), &wrap_key)
+                            let enc_key_bytes = aes_decrypt(packet.kx.as_ref(), &wrap_key)
                                 .map_err(|e| actix_web::error::ErrorUnauthorized(e.to_string()))?;
                             let enc_key: [u8; 32] = enc_key_bytes.as_slice()
                                 .try_into()
                                 .map_err(|_| actix_web::error::ErrorBadRequest("enc_key must be 32 bytes"))?;
 
                             if let Some(mut redis) = replay_store {
-                                let key_hex  = hex::encode(packet.wrapped_key.as_ref());
-                                let seen_key = format!("replay:seen:{}", key_hex);
+                                let seen_key = format!("replay:seen:{}", hex::encode(packet.kx.as_ref()));
                                 let is_new: bool = redis::cmd("SET")
                                     .arg(&seen_key).arg(1u8)
                                     .arg("NX").arg("EX").arg(60u64)
@@ -219,17 +211,12 @@ where
                 .await
                 .map_err(|_| actix_web::error::ErrorInternalServerError("body collect failed"))?;
 
-            let encrypted = match build_signed_response_raw(
-                &body_bytes, &session_keys.enc_key,
-            ) {
+            let encrypted = match build_signed_response_raw(&body_bytes, &session_keys.enc_key) {
                 Ok(b)  => b,
-                Err(e) => {
-                    tracing::error!("response encrypt: {e}");
-                    return Ok(ServiceResponse::new(
-                        req,
-                        head.set_body(BoxBody::new(body_bytes)).map_into_right_body(),
-                    ));
-                }
+                Err(_) => return Ok(ServiceResponse::new(
+                    req,
+                    head.set_body(BoxBody::new(body_bytes)).map_into_right_body(),
+                )),
             };
 
             Ok(ServiceResponse::new(

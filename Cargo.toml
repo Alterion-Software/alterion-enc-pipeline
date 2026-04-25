@@ -1,6 +1,6 @@
 [package]
 name = "alterion-encrypt"
-version = "1.3.1"
+version = "1.4.0"
 authors = ["Alterion Software"]
 edition = "2024"
 description = "X25519 ECDH key exchange, AES-256-GCM session encryption, Argon2id password hashing, and the MessagePack/deflate request-response pipeline with an Actix-web interceptor."
@@ -31,8 +31,10 @@ serde_json  = "1"
 rmp-serde   = "1.3"
 flate2      = "1"
 
-# Pepper key store — OS native keyring (Secret Service / Keychain / Credential Manager)
-keyring = "3"
+# Pepper key store — Linux kernel keyring (default, no D-Bus required)
+keyutils = "0.4"
+# Windows Credential Manager — only pulled in when the `win64` feature is enabled
+keyring  = { version = "3", default-features = false, optional = true }
 
 # Actix (interceptor middleware)
 actix-web  = "4"
@@ -50,5 +52,11 @@ chrono    = { version = "0.4", features = ["serde"] }
 uuid      = { version = "1", features = ["v4"] }
 thiserror = "2"
 tracing   = "0.1"
+libc      = "0.2"
 anyhow    = "1"
 redis     = { version = "1.2", features = ["tokio-comp", "connection-manager"] }
+
+[features]
+# Enable Windows Credential Manager via the `keyring` crate.
+# Usage: features = ["win64"]
+win64 = ["dep:keyring"]
