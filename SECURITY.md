@@ -14,7 +14,7 @@ If you discover a security vulnerability in `alterion-encrypt`, **please do not 
 
 Report it privately by emailing:
 
-**chaceberry686@gmail.com**
+**security@alterion.dpdns.org**
 
 Please include:
 - A description of the vulnerability
