@@ -57,7 +57,7 @@ fn argon2_instance() -> Argon2<'static> {
 ///
 /// Both `pepper` and the intermediate `peppered` value are [`Zeroizing`]-wrapped and wiped from
 /// memory after use.
-pub fn hash_password(password: &str) -> Result<(String, i16), CryptError> {
+pub fn hash_password(password: &str) -> Result<(String, i32), CryptError> {
     let (pepper_bytes, version) = pstore::get_current_pepper()
         .map_err(|e| CryptError::PstoreError(e.to_string()))?;
     let mut pepper   = Zeroizing::new(pepper_bytes);
@@ -82,7 +82,7 @@ pub fn hash_password(password: &str) -> Result<(String, i16), CryptError> {
 ///
 /// Returns `Ok(true)` on match, `Ok(false)` on mismatch, and `Err` only for keyring or hash
 /// parse failures.
-pub fn verify_password(password: &str, hash: &str, pepper_version: i16) -> Result<bool, CryptError> {
+pub fn verify_password(password: &str, hash: &str, pepper_version: i32) -> Result<bool, CryptError> {
     let pepper_bytes = pstore::get_pepper(pepper_version)
         .map_err(|e| CryptError::PstoreError(e.to_string()))?;
     let mut pepper   = Zeroizing::new(pepper_bytes);
@@ -97,7 +97,7 @@ pub fn verify_password(password: &str, hash: &str, pepper_version: i16) -> Resul
 }
 
 /// Returns the current pepper version number from the keyring.
-pub fn current_pepper_version() -> i16 {
+pub fn current_pepper_version() -> i32 {
     pstore::get_current_pepper().map(|(_, v)| v).unwrap_or(1)
 }
 
@@ -142,7 +142,7 @@ pub fn sha256_token_hash(token: &str) -> String {
 }
 
 fn derive_key_from_password(password: &str, salt: &[u8]) -> [u8; 32] {
-    let params = Params::new(65536, 3, 1, Some(32)).expect("valid argon2 params");
+    let params = Params::new(65536, 3, 4, Some(32)).expect("valid argon2 params");
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut key = [0u8; 32];
     argon2.hash_password_into(password.as_bytes(), salt, &mut key)

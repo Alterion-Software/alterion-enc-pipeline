@@ -103,18 +103,18 @@ fn store_set(key: &str, value: &str) -> Result<(), PstoreError> {
 
 // ── Shared logic ─────────────────────────────────────────────────────────────
 
-fn key_name(version: i16) -> String {
+fn key_name(version: i32) -> String {
     format!("{}{}", PEPPER_KEY_PREFIX, version)
 }
 
-fn read_current_version() -> Result<i16, PstoreError> {
+fn read_current_version() -> Result<i32, PstoreError> {
     match store_get(VERSION_POINTER_KEY)? {
-        Some(s) => s.trim().parse::<i16>().map_err(|_| PstoreError::InvalidEncoding),
+        Some(s) => s.trim().parse::<i32>().map_err(|_| PstoreError::InvalidEncoding),
         None    => { set_current_version(1)?; Ok(1) }
     }
 }
 
-fn set_current_version(version: i16) -> Result<(), PstoreError> {
+fn set_current_version(version: i32) -> Result<(), PstoreError> {
     store_set(VERSION_POINTER_KEY, &version.to_string())
 }
 
@@ -122,7 +122,7 @@ fn set_current_version(version: i16) -> Result<(), PstoreError> {
 ///
 /// This is the function [`crate::tools::crypt::hash_password`] calls. The returned `version` must
 /// be persisted alongside the password hash so the correct pepper can be fetched at verify time.
-pub fn get_current_pepper() -> Result<([u8; 32], i16), PstoreError> {
+pub fn get_current_pepper() -> Result<([u8; 32], i32), PstoreError> {
     let version = read_current_version()?;
     get_pepper(version).map(|p| (p, version))
 }
@@ -131,7 +131,7 @@ pub fn get_current_pepper() -> Result<([u8; 32], i16), PstoreError> {
 ///
 /// Called by [`crate::tools::crypt::verify_password`] with the version stored at hash time.
 /// Old versions are kept indefinitely — rotation does not delete them.
-pub fn get_pepper(version: i16) -> Result<[u8; 32], PstoreError> {
+pub fn get_pepper(version: i32) -> Result<[u8; 32], PstoreError> {
     match store_get(&key_name(version))? {
         Some(hex_str) => {
             let raw = Zeroizing::new(
@@ -160,7 +160,7 @@ fn generate_pepper() -> [u8; 32] {
 /// Existing hashes are **not invalidated** — they still reference their original version, which
 /// remains in the keyring. To fully migrate, re-hash users' passwords on their next successful
 /// login using [`crate::tools::crypt::hash_password`] (which will pick up the new active version).
-pub fn rotate_pepper() -> Result<i16, PstoreError> {
+pub fn rotate_pepper() -> Result<i32, PstoreError> {
     let current     = read_current_version()?;
     let new_version = current + 1;
     store_set(&key_name(new_version), &hex::encode(&generate_pepper()))?;

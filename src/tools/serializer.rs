@@ -56,6 +56,11 @@ use rand_core::{RngCore, OsRng};
 /// Maximum acceptable timestamp skew (seconds) between client and server for replay protection.
 pub const REPLAY_WINDOW_SECS: i64 = 30;
 
+/// Default cap on decompressed payload size used by [`decode_request_payload`] and [`decode_response_packet`].
+/// The [`crate::interceptor::Interceptor`] exposes `max_decompressed_bytes` so operators can set
+/// a higher (or lower) limit per deployment without recompiling.
+pub const MAX_DECOMPRESSED_SIZE: usize = 10 * 1024 * 1024; // 10 MiB
+
 /// Derives a 32-byte AES wrapping key from the ECDH shared secret via HKDF-SHA256,
 /// binding both parties' public keys into the derivation via the salt.
 ///
@@ -149,12 +154,23 @@ pub fn compress(data: &[u8]) -> Result<Vec<u8>, SerializerError> {
         .map_err(|e: std::io::Error| SerializerError::Compress(e.to_string()))
 }
 
-/// Deflate-decompresses `data` and returns the original bytes.
-pub fn decompress(data: &[u8]) -> Result<Vec<u8>, SerializerError> {
+/// Deflate-decompresses `data`, rejecting output that exceeds `max_size` bytes.
+///
+/// Pass [`MAX_DECOMPRESSED_SIZE`] for the standard limit, or a deployment-specific value
+/// when called from the [`crate::interceptor::Interceptor`].
+pub fn decompress(data: &[u8], max_size: usize) -> Result<Vec<u8>, SerializerError> {
     let mut decoder = DeflateDecoder::new(data);
     let mut out     = Vec::new();
-    decoder.read_to_end(&mut out)
+    decoder
+        .by_ref()
+        .take(max_size as u64 + 1)
+        .read_to_end(&mut out)
         .map_err(|e: std::io::Error| SerializerError::Decompress(e.to_string()))?;
+    if out.len() > max_size {
+        return Err(SerializerError::Decompress(
+            "decompressed payload exceeds size limit".into(),
+        ));
+    }
     Ok(out)
 }
 
@@ -183,7 +199,7 @@ pub fn decode_request_payload<T: DeserializeOwned>(
     decrypted_data: &[u8],
 ) -> Result<T, SerializerError> {
     let compressed: ByteBuf = deserialize(decrypted_data)?;
-    let json_bytes          = decompress(&compressed)?;
+    let json_bytes          = decompress(&compressed, MAX_DECOMPRESSED_SIZE)?;
     serde_json::from_slice(&json_bytes)
         .map_err(|e| SerializerError::Deserialize(e.to_string()))
 }
@@ -300,7 +316,7 @@ pub fn decode_response_packet<T: DeserializeOwned>(
     let decrypted        = aes_decrypt(signed.payload.as_ref(), enc_key)
         .map_err(|e| SerializerError::Deserialize(e.to_string()))?;
     let compressed: ByteBuf = deserialize(&decrypted)?;
-    let json_bytes       = decompress(&compressed)?;
+    let json_bytes       = decompress(&compressed, MAX_DECOMPRESSED_SIZE)?;
 
     serde_json::from_slice(&json_bytes)
         .map_err(|e| SerializerError::Deserialize(e.to_string()))
@@ -322,7 +338,7 @@ mod tests {
     #[test]
     fn compress_decompress_roundtrip() {
         let data = b"hello alterion enc pipeline payload";
-        assert_eq!(decompress(&compress(data).unwrap()).unwrap(), data);
+        assert_eq!(decompress(&compress(data).unwrap(), MAX_DECOMPRESSED_SIZE).unwrap(), data);
     }
 
     #[test]
@@ -357,14 +373,14 @@ mod tests {
 
         let decrypted: Vec<u8>   = aes_decrypt(&signed.payload, &enc_key).unwrap();
         let compressed: ByteBuf  = deserialize(&decrypted).unwrap();
-        let json_bytes           = decompress(&compressed).unwrap();
+        let json_bytes           = decompress(&compressed, MAX_DECOMPRESSED_SIZE).unwrap();
         let decoded: TestPayload = serde_json::from_slice(&json_bytes).unwrap();
         assert_eq!(payload, decoded);
     }
 
     #[test]
     fn decompress_garbage_returns_error() {
-        assert!(decompress(b"not compressed").is_err());
+        assert!(decompress(b"not compressed", MAX_DECOMPRESSED_SIZE).is_err());
     }
 
     /// Full client→server→client round trip with actual ephemeral ECDH and AES key wrapping.
