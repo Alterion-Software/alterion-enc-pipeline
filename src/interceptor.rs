@@ -6,13 +6,55 @@ use actix_web::{
 };
 use futures_util::future::{ready, LocalBoxFuture, Ready};
 use futures_util::TryStreamExt;
-use std::{rc::Rc, sync::Arc};
-use tokio::sync::RwLock;
+use std::{
+    collections::HashMap,
+    rc::Rc,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::sync::{Mutex, RwLock};
 use alterion_ecdh::{KeyStore, HandshakeStore, ecdh, ecdh_ephemeral};
 use redis::aio::ConnectionManager;
+use serde_bytes::ByteBuf;
 use crate::tools::crypt::aes_decrypt;
-use crate::tools::serializer::{deserialize_packet, build_signed_response_raw, derive_wrap_key};
+use crate::tools::serializer::{
+    deserialize_packet, deserialize, decompress,
+    build_signed_response_raw, derive_wrap_key,
+    MAX_DECOMPRESSED_SIZE,
+};
 use zeroize::ZeroizeOnDrop;
+
+/// Default maximum raw request body size (1 MiB). Override via [`Interceptor::max_body_bytes`].
+pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// In-memory replay protection store for environments without Redis.
+///
+/// Tracks seen `kx` hashes for a configurable TTL and prunes expired entries on each check.
+/// Wrap in `Arc` (via [`MemoryReplayStore::new`]) and share across all Actix workers via [`Interceptor`].
+pub struct MemoryReplayStore {
+    seen: Mutex<HashMap<String, Instant>>,
+    ttl:  Duration,
+}
+
+impl MemoryReplayStore {
+    /// Creates an `Arc`-wrapped store whose entries expire after `ttl`.
+    pub fn new(ttl: Duration) -> Arc<Self> {
+        Arc::new(Self { seen: Mutex::default(), ttl })
+    }
+
+    /// Returns `true` if `key` is new (not seen within `ttl`), inserting it.
+    /// Returns `false` on replay. Prunes expired entries on every call.
+    pub async fn is_new(&self, key: &str) -> bool {
+        let mut map = self.seen.lock().await;
+        let now = Instant::now();
+        map.retain(|_, inserted_at| now.duration_since(*inserted_at) < self.ttl);
+        if map.contains_key(key) {
+            return false;
+        }
+        map.insert(key.to_string(), now);
+        true
+    }
+}
 
 /// Raw decrypted request body, injected into Actix request extensions by [`Interceptor`] after a
 /// packet is successfully validated and decrypted.
@@ -45,6 +87,10 @@ pub struct RequestSessionKeys {
 /// response bodies using the X25519 ECDH + AES-256-GCM + HMAC-SHA256 pipeline.
 ///
 /// # Usage
+///
+/// Prefer [`Interceptor::new_with_memory_replay`] for new deployments — it enables in-memory
+/// replay protection and sensible body/decompression size limits without requiring Redis:
+///
 /// ```rust,no_run
 /// use alterion_encrypt::interceptor::Interceptor;
 /// use alterion_encrypt::{init_key_store, init_handshake_store, start_rotation};
@@ -52,27 +98,76 @@ pub struct RequestSessionKeys {
 /// let store = init_key_store(3600);
 /// let hs    = init_handshake_store();
 /// start_rotation(store.clone(), 3600, hs.clone());
-/// // App::new().wrap(Interceptor { key_store: store, handshake_store: hs, replay_store: None })
+/// // App::new().wrap(Interceptor::new_with_memory_replay(store, hs))
 /// ```
 ///
-/// **Request path** (POST / PUT / PATCH):
-/// 1. Collect raw body bytes.
+/// To tune size limits or add Redis replay protection after construction:
+/// ```rust,no_run
+/// # use alterion_encrypt::interceptor::Interceptor;
+/// # use alterion_encrypt::{init_key_store, init_handshake_store};
+/// # let store = init_key_store(3600);
+/// # let hs    = init_handshake_store();
+/// let mut interceptor = Interceptor::new_with_memory_replay(store, hs);
+/// interceptor.max_body_bytes        = 5 * 1024 * 1024;  // 5 MiB raw body
+/// interceptor.max_decompressed_bytes = 50 * 1024 * 1024; // 50 MiB decompressed
+/// // interceptor.replay_store = Some(redis_connection_manager);
+/// ```
+///
+/// **Request path** (POST / PUT / PATCH, and GET when `allow_encrypted_get` is `true`):
+/// 1. Collect raw body bytes up to `max_body_bytes` — reject 413 if exceeded.
 /// 2. MessagePack-decode a [`Request`](crate::tools::serializer::Request) and validate timestamp.
-/// 3. Perform X25519 ECDH using the server key identified by `key_id` and the client's ephemeral
-///    public key from the packet.
-/// 4. Derive a wrap key via HKDF-SHA256 and use it to AES-GCM-unwrap the client's `enc_key`.
-/// 5. AES-256-GCM-decrypt the payload using `enc_key`.
+/// 3. Check the replay store (Redis → in-memory fallback). Fails closed on store error.
+/// 4. ECDH → wrap key → AES-GCM unwrap `enc_key` → AES-256-GCM decrypt payload.
+/// 5. Preflight decompress against `max_decompressed_bytes` — reject 413 if exceeded.
 /// 6. Inject `DecryptedBody` and `RequestSessionKeys` into request extensions.
 ///
-/// Requests whose body is not a valid `Request` are passed through unchanged.
+/// Requests whose body is not a valid encrypted `Request` are passed through unchanged.
 ///
-/// **Response path** (only when `RequestSessionKeys` was set):
-/// JSON → deflate compress → msgpack → AES-256-GCM (`enc_key`) → HMAC-SHA256 (mac key derived
-/// from `enc_key`) → [`Response`](crate::tools::serializer::Response) → msgpack.
+/// **Response path** (only when `RequestSessionKeys` is present):
+/// JSON → deflate → msgpack → AES-256-GCM → HMAC-SHA256 → [`Response`](crate::tools::serializer::Response) → msgpack.
 pub struct Interceptor {
-    pub key_store:       Arc<RwLock<KeyStore>>,
-    pub handshake_store: HandshakeStore,
-    pub replay_store:    Option<ConnectionManager>,
+    pub key_store:             Arc<RwLock<KeyStore>>,
+    pub handshake_store:       HandshakeStore,
+    /// Redis-backed replay store. Takes precedence over `memory_replay_store` when `Some`.
+    pub replay_store:          Option<ConnectionManager>,
+    /// In-memory replay store used when `replay_store` is `None`.
+    /// Initialized automatically by [`Interceptor::new_with_memory_replay`].
+    pub memory_replay_store:   Option<Arc<MemoryReplayStore>>,
+    /// Maximum raw (compressed + encrypted) request body in bytes. Requests exceeding this are
+    /// rejected with 413 before any decryption occurs. Default: [`DEFAULT_MAX_BODY_BYTES`] (1 MiB).
+    pub max_body_bytes:        usize,
+    /// Maximum decompressed payload size in bytes. Requests whose payload would expand beyond this
+    /// are rejected with 413 after decryption but before the handler sees the body. Set this to
+    /// whatever your largest valid request body is — there is no upper bound imposed by the library.
+    /// Default: [`MAX_DECOMPRESSED_SIZE`] (10 MiB).
+    pub max_decompressed_bytes: usize,
+    /// When `true`, GET requests that carry a body are processed through the full encrypt/decrypt
+    /// pipeline identically to POST/PUT/PATCH. The client sends the msgpack-encoded [`Request`]
+    /// as the GET body using the same `buildRequestPacket` function. Default: `false`.
+    pub allow_encrypted_get:   bool,
+}
+
+impl Interceptor {
+    /// Creates an `Interceptor` with in-memory replay protection and default size limits
+    /// (1 MiB raw body, 10 MiB decompressed).
+    ///
+    /// This is the recommended constructor for new deployments. Tune `max_body_bytes` and
+    /// `max_decompressed_bytes` on the returned value for your workload, or assign `replay_store`
+    /// to upgrade to Redis-backed replay detection for multi-instance deployments.
+    pub fn new_with_memory_replay(
+        key_store:       Arc<RwLock<KeyStore>>,
+        handshake_store: HandshakeStore,
+    ) -> Self {
+        Self {
+            key_store,
+            handshake_store,
+            replay_store:           None,
+            memory_replay_store:    Some(MemoryReplayStore::new(Duration::from_secs(90))),
+            max_body_bytes:         DEFAULT_MAX_BODY_BYTES,
+            max_decompressed_bytes: MAX_DECOMPRESSED_SIZE,
+            allow_encrypted_get:    false,
+        }
+    }
 }
 
 impl<S, B> Transform<S, ServiceRequest> for Interceptor
@@ -87,11 +182,22 @@ where
     type Future    = Ready<Result<Self::Transform, Self::InitError>>;
 
     fn new_transform(&self, service: S) -> Self::Future {
+        if self.replay_store.is_none() && self.memory_replay_store.is_none() {
+            tracing::warn!(
+                "alterion-encrypt: no replay_store configured — replay attacks are possible \
+                 within the 30-second timestamp window. Use Interceptor::new_with_memory_replay() \
+                 or configure a Redis ConnectionManager for production deployments."
+            );
+        }
         ready(Ok(InterceptorService {
-            service:         Rc::new(service),
-            key_store:       self.key_store.clone(),
-            handshake_store: self.handshake_store.clone(),
-            replay_store:    self.replay_store.clone(),
+            service:               Rc::new(service),
+            key_store:             self.key_store.clone(),
+            handshake_store:       self.handshake_store.clone(),
+            replay_store:          self.replay_store.clone(),
+            memory_replay_store:   self.memory_replay_store.clone(),
+            max_body_bytes:        self.max_body_bytes,
+            max_decompressed_bytes: self.max_decompressed_bytes,
+            allow_encrypted_get:   self.allow_encrypted_get,
         }))
     }
 }
@@ -102,10 +208,14 @@ where
 /// and `Arc`-shared references to the key/handshake/replay stores. Not constructed directly —
 /// Actix creates it automatically when the middleware is mounted.
 pub struct InterceptorService<S> {
-    service:         Rc<S>,
-    key_store:       Arc<RwLock<KeyStore>>,
-    handshake_store: HandshakeStore,
-    replay_store:    Option<ConnectionManager>,
+    service:               Rc<S>,
+    key_store:             Arc<RwLock<KeyStore>>,
+    handshake_store:       HandshakeStore,
+    replay_store:          Option<ConnectionManager>,
+    memory_replay_store:   Option<Arc<MemoryReplayStore>>,
+    max_body_bytes:        usize,
+    max_decompressed_bytes: usize,
+    allow_encrypted_get:   bool,
 }
 
 impl<S, B> Service<ServiceRequest> for InterceptorService<S>
@@ -120,13 +230,22 @@ where
     forward_ready!(service);
 
     fn call(&self, mut req: ServiceRequest) -> Self::Future {
-        let service         = self.service.clone();
-        let key_store       = self.key_store.clone();
-        let handshake_store = self.handshake_store.clone();
-        let replay_store    = self.replay_store.clone();
+        let service               = self.service.clone();
+        let key_store             = self.key_store.clone();
+        let handshake_store       = self.handshake_store.clone();
+        let replay_store          = self.replay_store.clone();
+        let memory_replay_store   = self.memory_replay_store.clone();
+        let max_body_bytes        = self.max_body_bytes;
+        let max_decompressed_bytes = self.max_decompressed_bytes;
+        let allow_encrypted_get   = self.allow_encrypted_get;
 
         Box::pin(async move {
-            let has_body = !matches!(req.method().as_str(), "GET" | "HEAD" | "OPTIONS");
+            let method = req.method().as_str();
+            let has_body = match method {
+                "HEAD" | "OPTIONS" => false,
+                "GET"              => allow_encrypted_get,
+                _                  => true,
+            };
 
             if has_body {
                 let mut payload = req.take_payload();
@@ -136,6 +255,11 @@ where
                     .map_err(actix_web::error::ErrorBadRequest)?
                 {
                     raw.extend_from_slice(&chunk);
+                    if raw.len() > max_body_bytes {
+                        return Err(actix_web::error::ErrorPayloadTooLarge(
+                            "request body exceeds maximum allowed size",
+                        ));
+                    }
                 }
 
                 if !raw.is_empty() {
@@ -167,21 +291,34 @@ where
                                 .try_into()
                                 .map_err(|_| actix_web::error::ErrorBadRequest("enc_key must be 32 bytes"))?;
 
+                            let seen_key = format!("replay:seen:{}", hex::encode(packet.kx.as_ref()));
                             if let Some(mut redis) = replay_store {
-                                let seen_key = format!("replay:seen:{}", hex::encode(packet.kx.as_ref()));
                                 let is_new: bool = redis::cmd("SET")
                                     .arg(&seen_key).arg(1u8)
                                     .arg("NX").arg("EX").arg(60u64)
-                                    .query_async(&mut redis).await
-                                    .map(|v: Option<String>| v.is_some())
-                                    .unwrap_or(true);
+                                    .query_async::<Option<String>>(&mut redis)
+                                    .await
+                                    .map_err(|e| {
+                                        tracing::error!("replay store unavailable: {e}");
+                                        actix_web::error::ErrorInternalServerError("replay store unavailable")
+                                    })?
+                                    .is_some();
                                 if !is_new {
+                                    return Err(actix_web::error::ErrorUnauthorized("replay detected"));
+                                }
+                            } else if let Some(mem) = &memory_replay_store {
+                                if !mem.is_new(&seen_key).await {
                                     return Err(actix_web::error::ErrorUnauthorized("replay detected"));
                                 }
                             }
 
                             let decrypted = aes_decrypt(packet.data.as_ref(), &enc_key)
                                 .map_err(|e| actix_web::error::ErrorBadRequest(e.to_string()))?;
+
+                            let compressed: ByteBuf = deserialize(&decrypted)
+                                .map_err(|_| actix_web::error::ErrorBadRequest("payload msgpack decode failed"))?;
+                            decompress(&compressed, max_decompressed_bytes)
+                                .map_err(|_| actix_web::error::ErrorPayloadTooLarge("decompressed payload exceeds limit"))?;
 
                             req.extensions_mut().insert(DecryptedBody(decrypted));
                             req.extensions_mut().insert(RequestSessionKeys { enc_key });

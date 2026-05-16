@@ -59,7 +59,7 @@
 //!
 //!     HttpServer::new(move || {
 //!         App::new()
-//!             .wrap(Interceptor { key_store: store.clone(), handshake_store: hs.clone(), replay_store: None })
+//!             .wrap(Interceptor::new_with_memory_replay(store.clone(), hs.clone()))
 //!             .service(example_handler)
 //!     })
 //!     .bind("0.0.0.0:8080")?
